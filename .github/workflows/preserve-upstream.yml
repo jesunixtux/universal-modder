@@ -1,0 +1,77 @@
+# Keep an independent, non-destructive record of every upstream branch.
+# New branches and new commits are picked up on the next scheduled run.
+# Your own main branch and any personal branches are NEVER changed.
+name: Preserve upstream branches
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: preserve-upstream-branches
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'jesunixtux/universal-modder'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the fork's protected control branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Copy upstream branches without deleting local history
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git remote add upstream https://github.com/rehan-remade/universal-modder.git
+
+          # If the original is unavailable/deleted, fail visibly, but NEVER delete
+          # or reset a reference in this fork.
+          if ! git ls-remote --exit-code --heads upstream >/dev/null; then
+            echo "::error::Upstream is unavailable. All preserved branches remain untouched."
+            exit 1
+          fi
+
+          # Only remote-tracking refs in the ephemeral runner can be overwritten.
+          git fetch --no-tags upstream '+refs/heads/*:refs/remotes/upstream/*'
+          git fetch --no-tags origin '+refs/heads/upstream/*:refs/remotes/origin/upstream/*'
+
+          count=0
+          while IFS=' ' read -r branch new_sha; do
+            [[ -z "$branch" || "$branch" == "HEAD" ]] && continue
+            mirror_ref="refs/heads/upstream/$branch"
+
+            old_sha="$(git ls-remote --heads origin "$mirror_ref" | awk '{print $1}')"
+
+            if [[ -z "$old_sha" ]]; then
+              echo "New upstream branch: $branch"
+              git push origin "$new_sha:$mirror_ref"
+              count=$((count + 1))
+            elif [[ "$old_sha" == "$new_sha" ]]; then
+              echo "Unchanged: $branch"
+            elif git merge-base --is-ancestor "$old_sha" "$new_sha"; then
+              echo "Fast-forward: $branch"
+              git push origin "$new_sha:$mirror_ref"
+              count=$((count + 1))
+            else
+              # Upstream force-pushed or rewrote history. Preserve the PREVIOUS
+              # tip under an immutable, SHA-named branch before advancing.
+              history_ref="refs/heads/upstream-history/$branch/$old_sha"
+              echo "::warning::History rewrite detected on $branch. Archiving previous tip."
+              git push origin "$old_sha:$history_ref"
+              git push --force-with-lease="$mirror_ref:$old_sha" origin "$new_sha:$mirror_ref"
+              count=$((count + 1))
+            fi
+          done < <(git for-each-ref --format='%(refname:strip=3) %(objectname)' refs/remotes/upstream/)
+
+          echo "Updated/created $count upstream tracking branches."
+          echo "The fork's own main, personal branches, and previous history were not deleted."
