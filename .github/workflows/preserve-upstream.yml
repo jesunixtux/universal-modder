@@ -1,12 +1,21 @@
-# Keep an independent, non-destructive record of every upstream branch.
-# New branches and new commits are picked up on the next scheduled run.
-# Your own main branch and any personal branches are NEVER changed.
+# Keep an independent, non-destructive record of the upstream repository.
+#
+# GitHub's automatic GITHUB_TOKEN cannot create/update branches whose commits
+# introduce files under .github/workflows. To avoid false failures, this job:
+#   1) always writes an exact Git bundle to the upstream-recovery branch;
+#   2) mirrors normal upstream branches when GitHub allows it;
+#   3) never deletes preserved history when upstream disappears.
 name: Preserve upstream branches
 
 on:
   schedule:
     - cron: "23 * * * *"
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/preserve-upstream.yml"
 
 permissions:
   contents: write
@@ -20,58 +29,184 @@ jobs:
     if: github.repository == 'jesunixtux/universal-modder'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Check out the fork's protected control branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Copy upstream branches without deleting local history
+      - name: Preserve exact upstream repository and mirror browsable branches
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          git remote add upstream https://github.com/rehan-remade/universal-modder.git
+          UPSTREAM_URL="https://github.com/rehan-remade/universal-modder.git"
+          RECOVERY_REF="refs/heads/upstream-recovery"
 
-          # If the original is unavailable/deleted, fail visibly, but NEVER delete
-          # or reset a reference in this fork.
-          if ! git ls-remote --exit-code --heads upstream >/dev/null; then
-            echo "::error::Upstream is unavailable. All preserved branches remain untouched."
-            exit 1
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null ||             git remote set-url upstream "$UPSTREAM_URL"
+
+          # If upstream disappears or is temporarily unavailable, keep every
+          # existing backup untouched and finish cleanly. The recovery branch
+          # remains usable even if the original repository is gone.
+          if ! git ls-remote --exit-code --heads upstream >/dev/null 2>&1; then
+            echo "::warning::Upstream is unavailable. Existing preserved refs and the recovery bundle were left untouched."
+            exit 0
           fi
 
-          # Only remote-tracking refs in the ephemeral runner can be overwritten.
-          git fetch --no-tags upstream '+refs/heads/*:refs/remotes/upstream/*'
-          git fetch --no-tags origin '+refs/heads/upstream/*:refs/remotes/origin/upstream/*'
+          # ------------------------------------------------------------------
+          # 1. Exact recovery copy
+          # ------------------------------------------------------------------
+          # A Git bundle stores all upstream refs and objects as data, so it is
+          # not affected by GitHub's restriction on GITHUB_TOKEN modifying
+          # .github/workflows in mirrored branches.
+          mirror_dir="$RUNNER_TEMP/upstream-mirror.git"
+          bundle_file="$RUNNER_TEMP/universal-modder-upstream.bundle"
+          manifest_file="$RUNNER_TEMP/UPSTREAM-RECOVERY.md"
 
-          count=0
+          rm -rf "$mirror_dir" "$bundle_file" "$manifest_file"
+          git clone --mirror --quiet "$UPSTREAM_URL" "$mirror_dir"
+          git -C "$mirror_dir" bundle create "$bundle_file" --all
+          git -C "$mirror_dir" bundle verify "$bundle_file" >/dev/null
+
+          default_ref="$(git ls-remote --symref upstream HEAD | awk '/^ref:/ {print $2; exit}')"
+          default_branch="${default_ref#refs/heads/}"
+          default_sha="$(git ls-remote upstream "$default_ref" | awk '{print $1; exit}')"
+          captured_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          bundle_bytes="$(wc -c < "$bundle_file" | tr -d ' ')"
+
+          cat > "$manifest_file" <<EOF
+          # Universal Modder upstream recovery
+
+          This branch is managed automatically by GitHub Actions.
+
+          - Upstream: $UPSTREAM_URL
+          - Captured: $captured_at
+          - Default branch: $default_branch
+          - Default branch SHA: $default_sha
+          - Bundle size: $bundle_bytes bytes
+
+          The file `universal-modder-upstream.bundle` is an exact Git recovery
+          bundle containing the upstream repository's refs and objects, including
+          branches that GitHub Actions cannot mirror directly because they contain
+          workflow files.
+
+          Restore example:
+
+          ```bash
+          git clone universal-modder-upstream.bundle restored-universal-modder
+          ```
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          bundle_blob="$(git hash-object -w "$bundle_file")"
+          manifest_blob="$(git hash-object -w "$manifest_file")"
+          recovery_tree="$(
+            {
+              printf '100644 blob %s\tUPSTREAM-RECOVERY.md\n' "$manifest_blob"
+              printf '100644 blob %s\tuniversal-modder-upstream.bundle\n' "$bundle_blob"
+            } | git mktree
+          )"
+          recovery_commit="$(
+            printf 'Refresh exact upstream recovery bundle\n' | git commit-tree "$recovery_tree"
+          )"
+
+          old_recovery_sha="$(
+            git ls-remote --heads origin "$RECOVERY_REF" | awk '{print $1; exit}'
+          )"
+
+          if [[ -n "$old_recovery_sha" ]]; then
+            git push --force-with-lease="$RECOVERY_REF:$old_recovery_sha"               origin "$recovery_commit:$RECOVERY_REF"
+          else
+            git push origin "$recovery_commit:$RECOVERY_REF"
+          fi
+
+          echo "Exact recovery bundle refreshed on branch upstream-recovery."
+
+          # ------------------------------------------------------------------
+          # 2. Browsable branch mirrors (best effort)
+          # ------------------------------------------------------------------
+          git fetch --prune --no-tags upstream             '+refs/heads/*:refs/remotes/upstream/*'
+
+          # Existing preserved refs are fetched only so ancestry checks can be
+          # performed locally. Failure here is harmless for a brand-new mirror.
+          git fetch --no-tags origin             '+refs/heads/upstream/*:refs/remotes/origin/upstream/*' || true
+
+          updated=0
+          unchanged=0
+          bundle_only=0
+          push_failed=0
+
           while IFS=' ' read -r branch new_sha; do
             [[ -z "$branch" || "$branch" == "HEAD" ]] && continue
-            mirror_ref="refs/heads/upstream/$branch"
 
-            old_sha="$(git ls-remote --heads origin "$mirror_ref" | awk '{print $1}')"
+            mirror_ref="refs/heads/upstream/$branch"
+            old_sha="$(
+              git ls-remote --heads origin "$mirror_ref" | awk '{print $1; exit}'
+            )"
+
+            # GitHub Apps/GITHUB_TOKEN are not allowed to create or update a
+            # workflow file on another branch without the separate Workflows
+            # permission. Those branches are still preserved exactly in the
+            # recovery bundle above.
+            if git ls-tree -r --name-only "$new_sha" -- .github/workflows                 | grep -q .; then
+              echo "Bundle-only: $branch (contains .github/workflows)"
+              bundle_only=$((bundle_only + 1))
+              continue
+            fi
 
             if [[ -z "$old_sha" ]]; then
               echo "New upstream branch: $branch"
-              git push origin "$new_sha:$mirror_ref"
-              count=$((count + 1))
-            elif [[ "$old_sha" == "$new_sha" ]]; then
-              echo "Unchanged: $branch"
-            elif git merge-base --is-ancestor "$old_sha" "$new_sha"; then
-              echo "Fast-forward: $branch"
-              git push origin "$new_sha:$mirror_ref"
-              count=$((count + 1))
-            else
-              # Upstream force-pushed or rewrote history. Preserve the PREVIOUS
-              # tip under an immutable, SHA-named branch before advancing.
-              history_ref="refs/heads/upstream-history/$branch/$old_sha"
-              echo "::warning::History rewrite detected on $branch. Archiving previous tip."
-              git push origin "$old_sha:$history_ref"
-              git push --force-with-lease="$mirror_ref:$old_sha" origin "$new_sha:$mirror_ref"
-              count=$((count + 1))
+              if git push origin "$new_sha:$mirror_ref"; then
+                updated=$((updated + 1))
+              else
+                push_failed=$((push_failed + 1))
+              fi
+              continue
             fi
-          done < <(git for-each-ref --format='%(refname:strip=3) %(objectname)' refs/remotes/upstream/)
 
-          echo "Updated/created $count upstream tracking branches."
-          echo "The fork's own main, personal branches, and previous history were not deleted."
+            if [[ "$old_sha" == "$new_sha" ]]; then
+              echo "Unchanged: $branch"
+              unchanged=$((unchanged + 1))
+              continue
+            fi
+
+            if git merge-base --is-ancestor "$old_sha" "$new_sha"; then
+              echo "Fast-forward: $branch"
+              if git push origin "$new_sha:$mirror_ref"; then
+                updated=$((updated + 1))
+              else
+                push_failed=$((push_failed + 1))
+              fi
+              continue
+            fi
+
+            # If upstream rewrites history, archive the previous tip first.
+            # Neither operation is allowed to make the whole backup job fail:
+            # the exact bundle already contains the current upstream state.
+            history_ref="refs/heads/upstream-history/$branch/$old_sha"
+            echo "History rewrite detected on $branch; preserving previous tip."
+
+            if ! git push origin "$old_sha:$history_ref"; then
+              echo "::warning::Could not create history ref for $branch; the existing mirror was not deleted."
+            fi
+
+            if git push --force-with-lease="$mirror_ref:$old_sha"                 origin "$new_sha:$mirror_ref"; then
+              updated=$((updated + 1))
+            else
+              push_failed=$((push_failed + 1))
+            fi
+          done < <(
+            git for-each-ref               --format='%(refname:strip=3) %(objectname)'               refs/remotes/upstream/
+          )
+
+          echo "Mirror summary: updated=$updated unchanged=$unchanged bundle_only=$bundle_only push_failed=$push_failed"
+
+          if (( push_failed > 0 )); then
+            echo "::warning::$push_failed browsable branch mirror(s) could not be updated. The exact recovery bundle was still refreshed successfully."
+          fi
+
+          echo "The fork's main branch, personal branches, and previously preserved data were not deleted."
